@@ -146,8 +146,9 @@ def extract_pptx_text(pptx_path: Path) -> str:
     return _clean_text("\n\n".join(slide_texts))
 
 
-def load_documents() -> List[Document]:
+def load_documents(errors: Optional[List[str]] = None) -> List[Document]:
     documents: List[Document] = []
+    _errors = errors if errors is not None else []
 
     pdfs = list(_iter_files(BRAND_DECKS_DIR, (".pdf",))) + list(_iter_files(REPORTS_DATA_DIR, (".pdf",)))
     docxs = list(_iter_files(BRAND_DECKS_DIR, (".docx",))) + list(_iter_files(REPORTS_DATA_DIR, (".docx",)))
@@ -181,21 +182,27 @@ def load_documents() -> List[Document]:
             text = extract_pdf_text(p)
             add_text(text, source=str(p), doc_type="pdf")
         except Exception as e:
-            print(f"[PDF extraction failed] {p.name}: {type(e).__name__}: {e}")
+            msg = f"[PDF] {p.name}: {type(e).__name__}: {e}"
+            print(f"[PDF extraction failed] {msg}")
+            _errors.append(msg)
 
     for p in docxs:
         try:
             text = extract_docx_text(p)
             add_text(text, source=str(p), doc_type="docx")
         except Exception as e:
-            print(f"[DOCX extraction failed] {p.name}: {type(e).__name__}: {e}")
+            msg = f"[DOCX] {p.name}: {type(e).__name__}: {e}"
+            print(f"[DOCX extraction failed] {msg}")
+            _errors.append(msg)
 
     for p in pptxs:
         try:
             text = extract_pptx_text(p)
             add_text(text, source=str(p), doc_type="pptx")
         except Exception as e:
-            print(f"[PPTX extraction failed] {p.name}: {type(e).__name__}: {e}")
+            msg = f"[PPTX] {p.name}: {type(e).__name__}: {e}"
+            print(f"[PPTX extraction failed] {msg}")
+            _errors.append(msg)
 
     return documents
 
@@ -289,6 +296,37 @@ class PostgresVectorStore:
             conn.commit()
 
 
+def _diagnose_empty(extraction_errors: List[str]) -> str:
+    brand_files = list(_iter_files(BRAND_DECKS_DIR, (".pdf", ".docx", ".pptx")))
+    reports_files = list(_iter_files(REPORTS_DATA_DIR, (".pdf", ".docx", ".pptx")))
+    total_files = len(brand_files) + len(reports_files)
+
+    lines = ["No text could be extracted from your data folders."]
+    lines.append(
+        f"  Brand Solution Decks/ — exists={BRAND_DECKS_DIR.exists()}, {len(brand_files)} file(s)"
+    )
+    lines.append(
+        f"  Reports & Data/       — exists={REPORTS_DATA_DIR.exists()}, {len(reports_files)} file(s)"
+    )
+
+    if total_files == 0:
+        lines.append(
+            "No supported files (.pdf, .docx, .pptx) found. "
+            "Make sure these folders are present in your deployment."
+        )
+    elif extraction_errors:
+        lines.append(f"{len(extraction_errors)} extraction error(s) (first 10 shown):")
+        for e in extraction_errors[:10]:
+            lines.append(f"  • {e}")
+    else:
+        lines.append(
+            f"All {total_files} file(s) produced fewer than 50 characters of text — "
+            "they are likely scanned images. "
+            "OCR requires Poppler (pdftoppm) + Tesseract to be installed."
+        )
+    return "\n".join(lines)
+
+
 def build_vectorstore(rebuild: bool = False) -> Any:
     embeddings = HuggingFaceEmbeddings(model_name=DEFAULT_EMBEDDING_MODEL)
 
@@ -298,12 +336,10 @@ def build_vectorstore(rebuild: bool = False) -> Any:
         vs = PostgresVectorStore(SUPABASE_DB_URL, embeddings)
         if rebuild:
             vs.clear_all()
-            documents = load_documents()
+            extraction_errors: List[str] = []
+            documents = load_documents(errors=extraction_errors)
             if not documents:
-                raise RuntimeError(
-                    "No text extracted from your data folders. "
-                    "Check that PDFs are real text PDFs and that you have .docx/.pptx files."
-                )
+                raise RuntimeError(_diagnose_empty(extraction_errors))
             ids = [
                 _stable_doc_id(
                     source=str(d.metadata.get("source", "unknown")),
@@ -324,12 +360,9 @@ def build_vectorstore(rebuild: bool = False) -> Any:
         return vs
 
     if rebuild and VSTORE_DIR.exists():
-        # Chroma persistence is just files; easiest safe approach is "delete & rebuild".
-        # (We don't use destructive git commands here; only removes the local index folder.)
         for child in VSTORE_DIR.glob("**/*"):
             if child.is_file():
                 child.unlink(missing_ok=True)
-        # Remove empty folders.
         for child in sorted(VSTORE_DIR.glob("**/*"), reverse=True):
             if child.is_dir():
                 try:
@@ -340,12 +373,10 @@ def build_vectorstore(rebuild: bool = False) -> Any:
     if VSTORE_DIR.exists() and any(VSTORE_DIR.iterdir()) and not rebuild:
         return Chroma(persist_directory=str(VSTORE_DIR), embedding_function=embeddings)
 
-    documents = load_documents()
+    extraction_errors = []
+    documents = load_documents(errors=extraction_errors)
     if not documents:
-        raise RuntimeError(
-            "No text extracted from your data folders. "
-            "Check that PDFs are real text PDFs and that you have .docx/.pptx files."
-        )
+        raise RuntimeError(_diagnose_empty(extraction_errors))
 
     VSTORE_DIR.mkdir(parents=True, exist_ok=True)
     vs = Chroma.from_documents(
@@ -354,7 +385,9 @@ def build_vectorstore(rebuild: bool = False) -> Any:
         persist_directory=str(VSTORE_DIR),
         collection_name="meraki_history",
     )
-    vs.persist()
+    # persist() was removed in chromadb ≥ 0.4; persistence is now automatic.
+    if hasattr(vs, "persist"):
+        vs.persist()
     return vs
 
 
@@ -490,6 +523,83 @@ def forget_memory_record(vectorstore: Any, memory_id: str) -> None:
     if not memory_id:
         return
     vectorstore.delete(ids=[memory_id])
+
+
+def _parse_memory_text(text: str) -> dict:
+    """Parse the stored memory_text format back into structured fields."""
+    result = {"session_id": "", "timestamp": "", "user": "", "assistant": ""}
+    for line in text.split("\n")[:5]:
+        if line.startswith("Session: "):
+            result["session_id"] = line[9:].strip()
+        elif line.startswith("Timestamp: "):
+            result["timestamp"] = line[11:].strip()
+    user_marker = "\nUser:\n"
+    asst_marker = "\nAssistant:\n"
+    u = text.find(user_marker)
+    a = text.find(asst_marker)
+    if u != -1:
+        result["user"] = text[u + len(user_marker): a if a != -1 else None].strip()
+    if a != -1:
+        result["assistant"] = text[a + len(asst_marker):].strip()
+    return result
+
+
+def get_chat_sessions(vectorstore: Any) -> List[dict]:
+    """
+    Return all saved chat sessions stored in the vector store, sorted newest-first.
+    Each entry: {"session_id", "messages": [{"role", "content"}], "preview", "timestamp"}
+    """
+    from collections import defaultdict
+
+    raw: List[dict] = []
+
+    if VECTOR_BACKEND in {"postgres", "supabase"}:
+        try:
+            with vectorstore._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT content, metadata FROM meraki_documents "
+                        "WHERE metadata->>'type' = 'chat_memory' ORDER BY updated_at ASC"
+                    )
+                    for content, metadata in cur.fetchall():
+                        raw.append({"content": content or "", "metadata": metadata or {}})
+        except Exception as e:
+            print(f"[get_chat_sessions] Postgres error: {e}")
+    else:
+        try:
+            result = vectorstore._collection.get(
+                where={"type": {"$eq": "chat_memory"}},
+                include=["documents", "metadatas"],
+            )
+            for content, meta in zip(result.get("documents") or [], result.get("metadatas") or []):
+                raw.append({"content": content or "", "metadata": meta or {}})
+        except Exception as e:
+            print(f"[get_chat_sessions] Chroma error: {e}")
+
+    sessions: dict = defaultdict(lambda: {"messages": [], "latest_ts": "", "preview": ""})
+    for item in raw:
+        parsed = _parse_memory_text(item["content"])
+        sid = parsed["session_id"] or item["metadata"].get("session_id", "unknown")
+        if parsed["user"]:
+            sessions[sid]["messages"].append({"role": "user", "content": parsed["user"]})
+        if parsed["assistant"]:
+            sessions[sid]["messages"].append({"role": "assistant", "content": parsed["assistant"]})
+        if parsed["timestamp"] > sessions[sid]["latest_ts"]:
+            sessions[sid]["latest_ts"] = parsed["timestamp"]
+        if not sessions[sid]["preview"] and parsed["user"]:
+            sessions[sid]["preview"] = parsed["user"][:80]
+
+    out = [
+        {
+            "session_id": sid,
+            "messages": data["messages"],
+            "preview": data["preview"],
+            "timestamp": data["latest_ts"],
+        }
+        for sid, data in sessions.items()
+    ]
+    out.sort(key=lambda x: x["timestamp"], reverse=True)
+    return out
 
 
 def run_interactive(agent):
