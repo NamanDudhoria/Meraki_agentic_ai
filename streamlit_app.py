@@ -84,9 +84,13 @@ with st.sidebar:
     os.environ["ANTHROPIC_MODEL"] = str(model_name).strip()
     os.environ["MERAKI_TOP_K"] = str(int(top_k))
 
+    from pathlib import Path
+    from agent import BRAND_DECKS_DIR, REPORTS_DATA_DIR
+    _data_present = BRAND_DECKS_DIR.exists() or REPORTS_DATA_DIR.exists()
+
     col1, col2 = st.columns(2)
-    if col1.button("Rebuild Index", use_container_width=True):
-        with st.spinner("Rebuilding local vector index..."):
+    if col1.button("Rebuild Index", use_container_width=True, disabled=not _data_present):
+        with st.spinner("Rebuilding vector index..."):
             try:
                 build_vectorstore(rebuild=True)
                 reset_agent_cache()
@@ -95,6 +99,8 @@ with st.sidebar:
                 st.success("Index rebuilt.")
             except Exception as exc:
                 st.error(f"Rebuild failed:\n\n```\n{exc}\n```")
+    if not _data_present:
+        st.caption("Rebuild disabled — data folders not present. Run `python agent.py --ingest` locally.")
 
     if col2.button("Forget Last Turn", use_container_width=True):
         # Remove last assistant and user messages from UI history.

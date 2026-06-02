@@ -371,7 +371,7 @@ def build_vectorstore(rebuild: bool = False) -> Any:
                     pass
 
     if VSTORE_DIR.exists() and any(VSTORE_DIR.iterdir()) and not rebuild:
-        return Chroma(persist_directory=str(VSTORE_DIR), embedding_function=embeddings)
+        return Chroma(persist_directory=str(VSTORE_DIR), embedding_function=embeddings, collection_name="meraki_history")
 
     extraction_errors = []
     documents = load_documents(errors=extraction_errors)
@@ -405,8 +405,10 @@ def create_rag_agent(
         Search your Meraki historical solutions (brand decks, reports, and prior work) and return the most relevant excerpts.
         Always use this when you need to reference Meraki's past methodology, campaign patterns, funnels, or examples.
         """
-        # Pull a wider candidate set, then optionally filter cross-session chat memory.
-        docs = vectorstore.similarity_search(query, k=max(DEFAULT_TOP_K * 3, 12))
+        try:
+            docs = vectorstore.similarity_search(query, k=max(DEFAULT_TOP_K * 3, 12))
+        except Exception as e:
+            return f"[Database error — could not search Meraki knowledge base: {type(e).__name__}: {e}]"
         if not include_all_memory and session_id:
             filtered_docs: List[Document] = []
             for d in docs:

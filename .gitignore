@@ -1,3 +1,6 @@
 .env
 __pycache__/
 *.pyc
+.chroma_meraki/
+Brand Solution Decks/
+Reports & Data/
