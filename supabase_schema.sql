@@ -20,6 +20,7 @@ create index if not exists meraki_documents_embedding_idx
     with (lists = 100);
 
 -- 4. Similarity search function used by agent.py
+drop function if exists match_meraki_documents(vector, integer, jsonb);
 create or replace function match_meraki_documents(
     query_embedding vector(384),
     match_count     int,

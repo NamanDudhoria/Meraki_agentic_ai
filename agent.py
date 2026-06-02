@@ -434,38 +434,48 @@ def create_rag_agent(
     @tool
     def web_search(query: str) -> str:
         """
-        Search the live web (DuckDuckGo) for current sports/business/news/trends.
+        Search the live web for current sports/business/news/trends.
 
         Use this for competitor research, "today's" updates, recent partnerships, and fast market context.
         Returns top snippets with URLs so you can cite sources in your answer.
         """
+        results: List[str] = []
+
+        # Tavily (primary)
+        tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                client = TavilyClient(api_key=tavily_key)
+                response = client.search(query, max_results=6)
+                for i, r in enumerate(response.get("results", []), start=1):
+                    title = r.get("title") or "Untitled"
+                    url = r.get("url") or ""
+                    content = _clean_text(r.get("content") or r.get("snippet") or "")[:500]
+                    results.append(f"[{i}] {title}\nURL: {url}\n{content}")
+                if results:
+                    return "\n\n".join(results)
+            except Exception:
+                pass  # fall through to DuckDuckGo
+
+        # DuckDuckGo (fallback)
         try:
             from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                first_batch = list(ddgs.text(query, max_results=6) or [])
+                if not first_batch:
+                    first_batch = list(ddgs.news(query, max_results=6) or [])
+                for i, r in enumerate(first_batch, start=1):
+                    if not isinstance(r, dict):
+                        continue
+                    title = r.get("title") or "Untitled"
+                    href = r.get("href") or r.get("url") or ""
+                    body = _clean_text(r.get("body") or r.get("description") or r.get("snippet") or "")[:500]
+                    results.append(f"[{i}] {title}\nURL: {href}\n{body}")
         except Exception as e:
-            return f"DuckDuckGo search tool not available: {type(e).__name__}: {e}"
+            return f"[Web search unavailable: {type(e).__name__}. Answering from Meraki knowledge base only.]"
 
-        results: List[str] = []
-        with DDGS() as ddgs:
-            # First try "text" search; if that yields nothing, fall back to "news".
-            first_batch = list(ddgs.text(query, max_results=6) or [])
-            if not first_batch:
-                first_batch = list(ddgs.news(query, max_results=6) or [])
-
-            for i, r in enumerate(first_batch, start=1):
-                if not isinstance(r, dict):
-                    continue
-                title = r.get("title") or "Untitled"
-                href = r.get("href") or r.get("url") or ""
-                body = (
-                    r.get("body")
-                    or r.get("description")
-                    or r.get("snippet")
-                    or ""
-                )
-                body = _clean_text(body)[:500]
-                url_line = f"URL: {href}".strip()
-                results.append(f"[{i}] {title}\n{url_line}\n{body}")
-        return "\n\n".join(results) if results else "No web results found (text/news both empty)."
+        return "\n\n".join(results) if results else "No web results found."
 
     tools = [meraki_history_search, web_search]
 
